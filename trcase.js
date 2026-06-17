@@ -174,8 +174,47 @@ function saveInventory() {
 
 async function syncDataToFirebase(uid, username) {
     currentUsername = username;
-    await update(ref(database, 'users/' + uid), { username, inventory, balance });
-    await set(ref(database, 'usernames/' + username.toLowerCase()), uid);
+    const userRef = ref(database, 'users/' + uid);
+    const snap = await get(userRef);
+    if (snap.exists()) {
+        const data = snap.val();
+        if (data.username) currentUsername = data.username;
+        if (typeof data.balance === 'number') {
+            balance = data.balance;
+            localStorage.setItem('trcase_balance', balance);
+        }
+        if (Array.isArray(data.inventory)) {
+            inventory = data.inventory;
+            localStorage.setItem('trcase_inventory', JSON.stringify(inventory));
+        }
+    }
+    document.getElementById('balance').innerText = balance;
+    document.getElementById('user-display').innerText = `Ajan ${currentUsername}`;
+    await update(userRef, { username: currentUsername, inventory, balance });
+    await set(ref(database, 'usernames/' + currentUsername.toLowerCase()), uid);
+}
+
+async function findUserByNick(nick) {
+    const lower = nick.trim().toLowerCase();
+    const uidSnap = await get(ref(database, 'usernames/' + lower));
+    if (uidSnap.exists()) {
+        const uid = uidSnap.val();
+        const userSnap = await get(ref(database, 'users/' + uid));
+        if (userSnap.exists()) return { uid, ...userSnap.val() };
+    }
+    const usersSnap = await get(ref(database, 'users'));
+    if (!usersSnap.exists()) return null;
+    let found = null;
+    usersSnap.forEach(childSnap => {
+        const data = childSnap.val();
+        if (data?.username?.toLowerCase() === lower) {
+            found = { uid: childSnap.key, ...data };
+        }
+    });
+    if (found) {
+        await set(ref(database, 'usernames/' + lower), found.uid);
+    }
+    return found;
 }
 
 function renderHome() {
@@ -343,18 +382,28 @@ function renderInventory() {
     });
 }
 
-function pushToLiveDrops(item) {
+async function pushToLiveDrops(item) {
     if (!auth.currentUser) return;
-    if (item.price >= 50 || item.rarity === 'r-gold' || item.rarity === 'r-red') {
+    if (!(item.price >= 50 || item.rarity === 'r-gold' || item.rarity === 'r-red')) return;
+    try {
         const dropRef = push(ref(database, 'global_drops'));
-        set(dropRef, {
+        await set(dropRef, {
             username: currentUsername,
             itemName: item.name,
             itemImg: item.img,
             itemPrice: item.price,
             time: Date.now()
         });
-    }
+        const snap = await get(ref(database, 'global_drops'));
+        if (!snap.exists()) return;
+        const entries = Object.entries(snap.val()).map(([key, val]) => ({ key, ...val }));
+        if (entries.length <= 10) return;
+        entries.sort((a, b) => (b.itemPrice || 0) - (a.itemPrice || 0));
+        const removePromises = entries.slice(10).map(e =>
+            remove(ref(database, 'global_drops/' + e.key))
+        );
+        await Promise.all(removePromises);
+    } catch (_) { /* ignore drop sync errors */ }
 }
 
 function listenLiveDrops() {
@@ -400,33 +449,32 @@ document.addEventListener('click', () => {
 /* --- TAKAS --- */
 async function searchTradeUser() {
     const nick = document.getElementById('trade-username-input').value.trim();
+    const searchBtn = document.getElementById('btn-search-user');
     if (!nick) { alert('Bir kullanıcı adı yaz!'); return; }
     if (nick.toLowerCase() === currentUsername.toLowerCase()) {
         alert('Kendine takas atamazsın!');
         return;
     }
+    searchBtn.disabled = true;
+    searchBtn.textContent = 'Aranıyor...';
     try {
-        const uidSnap = await get(ref(database, 'usernames/' + nick.toLowerCase()));
-        if (!uidSnap.exists()) {
+        const data = await findUserByNick(nick);
+        if (!data) {
             alert('Kullanıcı bulunamadı! Tam nick yazdığından emin ol.');
             return;
         }
-        const uid = uidSnap.val();
-        const userSnap = await get(ref(database, 'users/' + uid));
-        if (!userSnap.exists()) {
-            alert('Kullanıcı verisi bulunamadı.');
-            return;
-        }
-        const data = userSnap.val();
-        targetTradeUser = { uid, username: data.username, inventory: data.inventory || [] };
+        targetTradeUser = { uid: data.uid, username: data.username, inventory: data.inventory || [] };
         document.getElementById('target-user-title').innerText = `${data.username} - Eşyaları`;
-        document.getElementById('trade-arena').style.display = 'flex';
+        document.getElementById('trade-arena').classList.add('is-visible');
         document.getElementById('btn-send-trade').style.display = 'block';
         myTradeSelection = [];
         theirTradeSelection = [];
         renderTradeArenas();
     } catch (err) {
-        alert('Arama hatası: ' + err.message);
+        alert('Arama hatası: ' + (err.message || 'Bağlantı sorunu'));
+    } finally {
+        searchBtn.disabled = false;
+        searchBtn.textContent = 'Oyuncu Bul';
     }
 }
 
@@ -434,7 +482,7 @@ function loadMyTradeInv() {
     myTradeSelection = [];
     theirTradeSelection = [];
     targetTradeUser = null;
-    document.getElementById('trade-arena').style.display = 'none';
+    document.getElementById('trade-arena').classList.remove('is-visible');
     document.getElementById('btn-send-trade').style.display = 'none';
 }
 
@@ -508,7 +556,7 @@ function listenIncomingTrades() {
         if (snapshot.exists()) {
             snapshot.forEach(childSnap => {
                 const trade = childSnap.val();
-                if (trade.toUser === currentUsername) {
+                if (trade.toUid === auth.currentUser?.uid || trade.toUser === currentUsername) {
                     hasTrade = true;
                     const offerText = (trade.offerItems || []).map(i => i.name).join(', ') || 'Hiçbir şey';
                     const reqText = (trade.requestItems || []).map(i => i.name).join(', ') || 'Hiçbir şey';
@@ -536,19 +584,30 @@ function listenIncomingTrades() {
     });
 }
 
+function removeItemsFromInventory(inv, items) {
+    (items || []).forEach(reqItem => {
+        const idx = inv.findIndex(i => i.name === reqItem.name && i.price === reqItem.price);
+        if (idx > -1) inv.splice(idx, 1);
+    });
+}
+
 async function acceptTrade(tradeId, trade) {
     try {
-        if (trade.requestItems?.length) {
-            trade.requestItems.forEach(reqItem => {
-                const idx = inventory.findIndex(i => i.name === reqItem.name && i.price === reqItem.price);
-                if (idx > -1) inventory.splice(idx, 1);
-            });
-        }
-        if (trade.offerItems?.length) {
-            trade.offerItems.forEach(item => inventory.push({ ...item }));
-        }
+        removeItemsFromInventory(inventory, trade.requestItems);
+        (trade.offerItems || []).forEach(item => inventory.push({ ...item }));
         saveInventory();
         renderInventory();
+
+        if (trade.fromUid) {
+            const senderSnap = await get(ref(database, 'users/' + trade.fromUid));
+            if (senderSnap.exists()) {
+                let senderInv = [...(senderSnap.val().inventory || [])];
+                removeItemsFromInventory(senderInv, trade.offerItems);
+                (trade.requestItems || []).forEach(item => senderInv.push({ ...item }));
+                await update(ref(database, 'users/' + trade.fromUid), { inventory: senderInv });
+            }
+        }
+
         await remove(ref(database, 'trades/' + tradeId));
         alert('Takas kabul edildi! Envanter güncellendi.');
     } catch (err) {
@@ -640,6 +699,7 @@ async function createBattle() {
         battleSelectedCases = [];
         renderBattleSelectedCases();
         subscribeToBattle(battleId);
+        switchScreen('battles');
         alert('Savaş oluşturuldu! Bekleme odasındasın.');
     } catch (err) {
         alert('Savaş oluşturulamadı: ' + err.message);
@@ -745,7 +805,6 @@ function subscribeToBattle(battleId) {
 
         if (battle.status === 'waiting' &&
             battle.players.length >= battle.maxPlayers &&
-            battle.hostUid === auth.currentUser.uid &&
             !battleRunning) {
             startBattle(battleId, battle);
         }
@@ -778,9 +837,25 @@ function deductBattleCost(battleId, cost) {
 }
 
 async function startBattle(battleId, battle) {
+    if (battleRunning) return;
+    let shouldRun = false;
+    try {
+        await runTransaction(ref(database, 'battles/' + battleId), (b) => {
+            if (!b || b.status !== 'waiting') return b;
+            if ((b.players || []).length < b.maxPlayers) return b;
+            if (b.startedBy) return b;
+            b.status = 'running';
+            b.startedBy = auth.currentUser.uid;
+            b.currentRound = 0;
+            shouldRun = true;
+            return b;
+        });
+    } catch (_) {
+        return;
+    }
+    if (!shouldRun) return;
+
     battleRunning = true;
-    const cost = battle.totalCost || getBattleCost(battle.cases);
-    deductBattleCost(battleId, cost);
 
     const playerResults = {};
     battle.players.forEach(p => {
