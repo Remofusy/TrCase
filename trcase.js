@@ -132,6 +132,14 @@ function getRandomItem(itemList) {
     return itemList[0];
 }
 
+function getItemPriceByName(itemName) {
+    for (const c of Object.values(casesData)) {
+        const item = c.items.find(i => i.name === itemName);
+        if (item) return item.price;
+    }
+    return 0;
+}
+
 function switchScreen(screenId) {
     document.getElementById('home-screen').style.display = screenId === 'cases' ? 'flex' : 'none';
     document.getElementById('items-screen').style.display = screenId === 'items' ? 'block' : 'none';
@@ -417,7 +425,8 @@ function listenLiveDrops() {
             return;
         }
         const topDrops = Object.values(data)
-            .sort((a, b) => (b.itemPrice || 0) - (a.itemPrice || 0))
+            .map(d => ({ ...d, itemPrice: d.itemPrice ?? getItemPriceByName(d.itemName) }))
+            .sort((a, b) => b.itemPrice - a.itemPrice)
             .slice(0, 10);
 
         function makeDropEl(d) {
@@ -776,6 +785,7 @@ async function joinBattle(battleId) {
         });
         currentBattleId = battleId;
         subscribeToBattle(battleId);
+        switchScreen('battles');
     } catch (err) {
         alert('Katılım hatası: ' + err.message);
     }
@@ -787,13 +797,16 @@ function subscribeToBattle(battleId) {
     document.getElementById('battle-lobby-panel').style.display = 'block';
 
     const battleRef = ref(database, 'battles/' + battleId);
-    onValue(battleRef, (snap) => {
+    battleUnsubscribe = onValue(battleRef, (snap) => {
         const battle = snap.val();
         if (!battle) {
             leaveBattleLocal();
             return;
         }
-        renderBattleLobby(battle);
+        if (battle.status === 'waiting') {
+            renderBattleLobby(battle);
+            document.getElementById('battle-active-panel').style.display = 'none';
+        }
         if (battle.status === 'running') {
             deductBattleCost(battleId, battle.totalCost || getBattleCost(battle.cases));
             renderBattleActive(battle);
@@ -954,6 +967,10 @@ function renderBattleFinished(battle) {
 }
 
 function leaveBattleLocal() {
+    if (battleUnsubscribe) {
+        battleUnsubscribe();
+        battleUnsubscribe = null;
+    }
     currentBattleId = null;
     battleRunning = false;
     document.getElementById('battle-list-panel').style.display = 'block';
